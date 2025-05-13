@@ -1,13 +1,11 @@
 import { switchChain } from "$lib/services/transfer-ucs03-cosmos"
+import type { EffectToExit, HasKey } from "$lib/types"
 import type { SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate"
 import { executeContract } from "@unionlabs/sdk/cosmos"
 import type { Chain } from "@unionlabs/sdk/schema"
-import { Data, Effect, type Exit, Schedule } from "effect"
+import { Data, Effect, Exit, pipe, Predicate, Schedule } from "effect"
 
-export type EffectToExit<T> = T extends Effect.Effect<infer A, infer E, any> ? Exit.Exit<A, E>
-  : never
-
-export type TransactionSubmissionCosmos = Data.TaggedEnum<{
+export type TransactionState = Data.TaggedEnum<{
   Filling: {}
   SwitchChainInProgress: {}
   SwitchChainComplete: { exit: EffectToExit<ReturnType<typeof switchChain>> }
@@ -17,24 +15,26 @@ export type TransactionSubmissionCosmos = Data.TaggedEnum<{
     exit: EffectToExit<ReturnType<typeof executeContract>>
   }
 }>
+type ExitStates = HasKey<TransactionState, "exit">
 
-export const TransactionSubmissionCosmos = Data.taggedEnum<TransactionSubmissionCosmos>()
-const {
+export const TransactionState = Data.taggedEnum<TransactionState>()
+export const {
   SwitchChainInProgress,
   SwitchChainComplete,
   WriteContractInProgress,
   WriteContractComplete,
-} = TransactionSubmissionCosmos
+  $is: is,
+} = TransactionState
 
-export const nextStateCosmos = async (
-  ts: TransactionSubmissionCosmos,
+export const nextState = async (
+  ts: TransactionState,
   chain: Chain,
   senderAddress: string,
   contractAddress: string,
   msg: Record<string, unknown>,
   funds?: ReadonlyArray<{ denom: string; amount: string }>,
-): Promise<TransactionSubmissionCosmos> =>
-  TransactionSubmissionCosmos.$match(ts, {
+): Promise<TransactionState> =>
+  TransactionState.$match(ts, {
     Filling: () => {
       return SwitchChainInProgress()
     },
@@ -86,12 +86,27 @@ export const nextStateCosmos = async (
     },
   })
 
-export const hasFailedExit = (state: TransactionSubmissionCosmos) =>
+export const hasFailedExit = (state: TransactionState) =>
   "exit" in state && state.exit._tag === "Failure"
 
-export const isComplete = (state: TransactionSubmissionCosmos): string | false => {
+// TODO: make single-responsibility
+export const isComplete = (state: TransactionState): string | false => {
   if (state._tag === "WriteContractComplete" && state.exit._tag === "Success") {
     return state.exit.value.transactionHash
   }
   return false
 }
+
+// TODO: reinvestigate type narrowing
+// @ts-expect-error
+export const hasSuccessfulExit: <T extends ExitStates>(
+  _: T,
+  // @ts-expect-error
+) => _ is ExitToSuccess<T> = (_) =>
+  pipe(
+    _,
+    Predicate.compose(
+      Predicate.hasProperty("exit"),
+      (x) => Exit.isSuccess(x.exit as Exit.Exit<any, any>),
+    ),
+  )

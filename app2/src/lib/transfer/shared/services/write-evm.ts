@@ -1,8 +1,10 @@
 import { switchChain } from "$lib/services/transfer-ucs03-evm"
 import { resolveSafeTx } from "$lib/transfer/shared/services/handlers/safe-hash.ts"
+import type { EffectToExit, HasKey } from "$lib/types"
 import { getLastConnectedWalletId } from "$lib/wallet/evm/config.svelte.ts"
 import { ViemPublicClient, waitForTransactionReceipt, writeContract } from "@unionlabs/sdk/evm"
-import { Data, Effect, type Exit } from "effect"
+import { Data, Effect, Exit, flow, pipe, Predicate } from "effect"
+import type { Simplify } from "effect/Types"
 import type {
   Abi,
   Chain,
@@ -14,10 +16,7 @@ import type {
   WriteContractParameters,
 } from "viem"
 
-export type EffectToExit<T> = T extends Effect.Effect<infer A, infer E, any> ? Exit.Exit<A, E>
-  : never
-
-export type TransactionSubmissionEvm = Data.TaggedEnum<{
+export type TransactionState = Data.TaggedEnum<{
   Filling: {}
   SwitchChainInProgress: {}
   SwitchChainComplete: { exit: EffectToExit<ReturnType<typeof switchChain>> }
@@ -27,9 +26,10 @@ export type TransactionSubmissionEvm = Data.TaggedEnum<{
   TransactionReceiptInProgress: { readonly hash: Hash } // on chain hash
   TransactionReceiptComplete: { exit: EffectToExit<ReturnType<typeof waitForTransactionReceipt>> }
 }>
+type ExitStates = HasKey<TransactionState, "exit">
 
-export const TransactionSubmissionEvm = Data.taggedEnum<TransactionSubmissionEvm>()
-const {
+export const TransactionState = Data.taggedEnum<TransactionState>()
+export const {
   SwitchChainInProgress,
   SwitchChainComplete,
   WriteContractInProgress,
@@ -37,9 +37,10 @@ const {
   WaitForSafeWalletHash,
   TransactionReceiptInProgress,
   TransactionReceiptComplete,
-} = TransactionSubmissionEvm
+  $is: is,
+} = TransactionState
 
-export const nextStateEvm = async <
+export const nextState = async <
   TAbi extends Abi,
   TFunctionName extends ContractFunctionName<TAbi, "nonpayable" | "payable"> = ContractFunctionName<
     TAbi,
@@ -51,13 +52,13 @@ export const nextStateEvm = async <
     TFunctionName
   > = ContractFunctionArgs<TAbi, "nonpayable" | "payable", TFunctionName>,
 >(
-  ts: TransactionSubmissionEvm,
+  ts: TransactionState,
   chain: Chain,
   publicClient: PublicClient,
   walletClient: WalletClient,
   params: WriteContractParameters<TAbi, TFunctionName, TArgs>,
-): Promise<TransactionSubmissionEvm> =>
-  TransactionSubmissionEvm.$match(ts, {
+): Promise<TransactionState> =>
+  TransactionState.$match(ts, {
     Filling: () => SwitchChainInProgress(),
 
     SwitchChainInProgress: async () => {
@@ -110,12 +111,26 @@ export const nextStateEvm = async <
     TransactionReceiptComplete: () => ts,
   })
 
-export const hasFailedExit = (state: TransactionSubmissionEvm) =>
+export const hasFailedExit = (state: TransactionState) =>
   "exit" in state && state.exit._tag === "Failure"
 
-export const isComplete = (state: TransactionSubmissionEvm): string | false => {
+// TODO: make single-responsibility
+export const isComplete = (state: TransactionState): string | false => {
   if (state._tag === "TransactionReceiptComplete" && state.exit._tag === "Success") {
     return state.exit.value.transactionHash
   }
   return false
 }
+
+// @ts-expect-error
+export const hasSuccessfulExit: <T extends ExitStates>(
+  _: T,
+  // @ts-expect-error
+) => _ is ExitToSuccess<T> = (_) =>
+  pipe(
+    _,
+    Predicate.compose(
+      Predicate.hasProperty("exit"),
+      (x) => Exit.isSuccess(x.exit as Exit.Exit<any, any>),
+    ),
+  )

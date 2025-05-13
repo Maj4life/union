@@ -23,6 +23,7 @@ export const switchChain = (chain: Chain) =>
     const { connectedWallet, connectionStatus } = cosmosStore
     if (connectionStatus !== "connected" || !connectedWallet) {
       return yield* new CosmosWalletNotConnectedError({
+        // TODO: move to `message`
         cause: "wallet not connected according to cosmosStore",
       })
     }

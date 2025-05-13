@@ -8,27 +8,19 @@ import { getWagmiConnectorClient } from "$lib/services/evm/clients.ts"
 import { transferHashStore } from "$lib/stores/transfer-hash.svelte.ts"
 import { wallets } from "$lib/stores/wallets.svelte.ts"
 import type { SubmitInstruction } from "$lib/transfer/normal/steps/steps.ts"
-import {
-  hasFailedExit as cosmosHasFailedExit,
-  isComplete as cosmosIsComplete,
-  nextStateCosmos,
-  TransactionSubmissionCosmos,
-} from "$lib/transfer/shared/services/write-cosmos.ts"
-import {
-  hasFailedExit as evmHasFailedExit,
-  isComplete as evmIsComplete,
-  nextStateEvm,
-  TransactionSubmissionEvm,
-} from "$lib/transfer/shared/services/write-evm.ts"
+import * as WriteCosmos from "$lib/transfer/shared/services/write-cosmos.ts"
+import * as WriteEvm from "$lib/transfer/shared/services/write-evm.ts"
 import { isValidBech32ContractAddress } from "$lib/utils"
+import type { ExecuteContractError } from "@unionlabs/sdk/cosmos"
 import { createViemPublicClient, createViemWalletClient } from "@unionlabs/sdk/evm"
 import { instructionAbi } from "@unionlabs/sdk/evm/abi"
 import { encodeAbi } from "@unionlabs/sdk/ucs03/instruction.ts"
 import { extractErrorDetails, generateSalt } from "@unionlabs/sdk/utils"
 import { getTimeoutInNanoseconds24HoursFromNow } from "@unionlabs/sdk/utils/timeout.ts"
 import { http } from "@wagmi/core"
-import { Cause, Effect, Exit, Match, Option } from "effect"
-import { constVoid } from "effect/Function"
+import { Cause, Effect, Exit, Match, Option, Predicate, Unify } from "effect"
+import { not } from "effect/Boolean"
+import { compose, constVoid, flow, pipe } from "effect/Function"
 import { custom, encodeAbiParameters, fromHex } from "viem"
 
 type Props = {
@@ -43,12 +35,12 @@ const { stepIndex, step, onSubmit, cancel, actionButtonText }: Props = $props()
 
 let showError = $state(false)
 
-let ets = $state<TransactionSubmissionEvm>(TransactionSubmissionEvm.Filling())
-let cts = $state<TransactionSubmissionCosmos>(TransactionSubmissionCosmos.Filling())
+let ets = $state<WriteEvm.TransactionState>(WriteEvm.TransactionState.Filling())
+let cts = $state<WriteCosmos.TransactionState>(WriteCosmos.TransactionState.Filling())
 let error = $state<Option.Option<unknown>>(Option.none())
 let isSubmitting = $state(false)
 
-const needsRetry = $derived(evmHasFailedExit(ets) || cosmosHasFailedExit(cts))
+const needsRetry = $derived(WriteEvm.hasFailedExit(ets) || WriteCosmos.hasFailedExit(cts))
 
 const isButtonEnabled = $derived(
   !isSubmitting && ((ets._tag === "Filling" && cts._tag === "Filling") || needsRetry),
@@ -71,8 +63,8 @@ const getSubmitButtonText = $derived(
 )
 
 const resetState = () => {
-  ets = TransactionSubmissionEvm.Filling()
-  cts = TransactionSubmissionCosmos.Filling()
+  ets = WriteEvm.TransactionState.Filling()
+  cts = WriteCosmos.TransactionState.Filling()
   error = Option.none()
   isSubmitting = false
 }
@@ -87,56 +79,61 @@ export const submit = Effect.gen(function*() {
   isSubmitting = true
   error = Option.none()
 
-  try {
-    const sourceChainRpcType = step.intent.sourceChain.rpc_type
+  const doEvm = Effect.gen(function*() {
+    const viemChain = yield* step.intent.sourceChain.toViemChain()
+    const publicClient = yield* createViemPublicClient({
+      chain: viemChain,
+      transport: http(),
+    })
 
-    yield* Match.value(sourceChainRpcType).pipe(
-      Match.when("evm", () =>
-        Effect.gen(function*() {
-          const viemChain = step.intent.sourceChain.toViemChain()
-          if (Option.isNone(viemChain)) {
-            return Effect.succeed(null)
-          }
+    const connectorClient = yield* getWagmiConnectorClient
 
-          const publicClient = yield* createViemPublicClient({
-            chain: viemChain.value,
-            transport: http(),
-          })
+    const walletClient = yield* createViemWalletClient({
+      account: connectorClient.account,
+      chain: viemChain,
+      transport: custom(connectorClient),
+    })
 
-          const connectorClient = yield* getWagmiConnectorClient
+    const timeoutTimestamp = getTimeoutInNanoseconds24HoursFromNow()
+    const salt = yield* generateSalt("evm")
 
-          const walletClient = yield* createViemWalletClient({
-            account: connectorClient.account,
-            chain: viemChain.value,
-            transport: custom(connectorClient),
-          })
-
-          do {
-            const timeoutTimestamp = getTimeoutInNanoseconds24HoursFromNow()
-            const salt = yield* generateSalt("evm")
-            ets = yield* Effect.promise(() =>
-              nextStateEvm(ets, viemChain.value, publicClient, walletClient, {
-                chain: viemChain.value,
-                account: connectorClient.account,
-                address: step.intent.channel.source_port_id,
-                abi: ucs03ZkgmAbi,
-                functionName: "send",
-                args: [
-                  step.intent.channel.source_channel_id,
-                  0n,
-                  timeoutTimestamp,
-                  salt,
-                  {
-                    opcode: step.instruction.opcode,
-                    version: step.instruction.version,
-                    operand: encodeAbi(step.instruction),
-                  },
-                ],
-              })
-            )
-
-            if (ets._tag === "SwitchChainComplete" || ets._tag === "WriteContractComplete") {
-              yield* Exit.matchEffect(ets.exit, {
+    yield* pipe(
+      Effect.promise(() =>
+        WriteEvm.nextState(ets, viemChain, publicClient, walletClient, {
+          chain: viemChain,
+          account: connectorClient.account,
+          address: step.intent.channel.source_port_id,
+          abi: ucs03ZkgmAbi,
+          functionName: "send",
+          args: [
+            step.intent.channel.source_channel_id,
+            0n,
+            timeoutTimestamp,
+            salt,
+            {
+              opcode: step.instruction.opcode,
+              version: step.instruction.version,
+              operand: encodeAbi(step.instruction),
+            },
+          ],
+        })
+      ),
+      Effect.tap(nextEts =>
+        Effect.sync(() => {
+          console.log(`ETS transitioning: ${ets._tag} -> ${nextEts._tag}`)
+          ets = nextEts
+        })
+      ),
+      Effect.tap((x) =>
+        pipe(
+          Match.value(x),
+          Match.when(
+            Predicate.or(
+              WriteEvm.is("SwitchChainComplete"),
+              WriteEvm.is("WriteContractComplete"),
+            ),
+            (a) =>
+              Exit.matchEffect(Unify.unify(a.exit), {
                 onFailure: cause =>
                   Effect.sync(() => {
                     error = Option.some(Cause.squash(cause))
@@ -146,99 +143,132 @@ export const submit = Effect.gen(function*() {
                   Effect.sync(() => {
                     error = Option.none()
                   }),
-              })
-            }
+              }),
+          ),
+          Match.orElse(() => Effect.void),
+        )
+      ),
+      Effect.repeat({
+        until: Predicate.compose(
+          WriteEvm.is("TransactionReceiptComplete"),
+          WriteEvm.hasSuccessfulExit,
+        ),
+        while: compose(WriteEvm.hasFailedExit, not),
+      }),
+      Effect.andThen(({ exit }) =>
+        Effect.sync(() => {
+          transferHashStore.startPolling(exit.value.transactionHash)
+          onSubmit()
+        })
+      ),
+    )
+  })
 
-            const result = evmIsComplete(ets)
-            if (result) {
-              transferHashStore.startPolling(result)
-              onSubmit()
-              break
-            }
-          } while (!evmHasFailedExit(ets))
+  const doCosmos = Effect.gen(function*() {
+    const walletCosmosAddress = yield* wallets.cosmosAddress
 
-          return Effect.succeed(ets)
-        })),
-      Match.when("cosmos", () =>
-        Effect.gen(function*() {
-          const walletCosmosAddress = yield* wallets.cosmosAddress
+    const sender = yield* step.intent.sourceChain.getDisplayAddress(walletCosmosAddress)
+    const isNative = !isValidBech32ContractAddress(step.intent.baseToken)
 
-          const sender = yield* step.intent.sourceChain.getDisplayAddress(walletCosmosAddress)
-          const isNative = !isValidBech32ContractAddress(step.intent.baseToken)
+    const baseToken = step.intent.baseToken === "xion" ? "uxion" : step.intent.baseToken
+    const timeout_timestamp = getTimeoutInNanoseconds24HoursFromNow().toString()
+    const salt = yield* generateSalt("cosmos")
 
-          const baseToken = step.intent.baseToken === "xion" ? "uxion" : step.intent.baseToken
-
-          do {
-            const timeout_timestamp = getTimeoutInNanoseconds24HoursFromNow().toString()
-            const salt = yield* generateSalt("cosmos")
-            cts = yield* Effect.promise(() =>
-              nextStateCosmos(
-                cts,
-                step.intent.sourceChain,
-                sender,
-                fromHex(step.intent.channel.source_port_id, "string"),
-                {
-                  send: {
-                    channel_id: step.intent.channel.source_channel_id,
-                    timeout_height: "0",
-                    timeout_timestamp,
-                    salt,
-                    instruction: encodeAbiParameters(instructionAbi, [
-                      step.instruction.version,
-                      step.instruction.opcode,
-                      encodeAbi(step.instruction),
-                    ]),
-                  },
-                },
-                isNative
-                  ? [
-                    {
-                      denom: baseToken,
-                      amount: step.intent.baseAmount.toString(),
-                    },
-                  ]
-                  : undefined,
-              )
-            )
-
-            if (cts._tag === "SwitchChainComplete" || cts._tag === "WriteContractComplete") {
-              yield* Exit.matchEffect(cts.exit, {
+    yield* pipe(
+      Effect.promise(() =>
+        WriteCosmos.nextState(
+          cts,
+          step.intent.sourceChain,
+          sender,
+          fromHex(step.intent.channel.source_port_id, "string"),
+          {
+            send: {
+              channel_id: step.intent.channel.source_channel_id,
+              timeout_height: "0",
+              timeout_timestamp,
+              salt,
+              instruction: encodeAbiParameters(instructionAbi, [
+                step.instruction.version,
+                step.instruction.opcode,
+                encodeAbi(step.instruction),
+              ]),
+            },
+          },
+          isNative
+            ? [
+              {
+                denom: baseToken,
+                amount: step.intent.baseAmount.toString(),
+              },
+            ]
+            : undefined,
+        )
+      ),
+      Effect.tap(nextCts =>
+        Effect.sync(() => {
+          console.log(`CTS transitioning: ${cts._tag} -> ${nextCts._tag}`)
+          cts = nextCts
+        })
+      ),
+      Effect.tap((x) =>
+        pipe(
+          Match.value(x),
+          Match.when(
+            Predicate.or(
+              WriteCosmos.is("SwitchChainComplete"),
+              WriteCosmos.is("WriteContractComplete"),
+            ),
+            (a) =>
+              Exit.matchEffect(Unify.unify(a.exit), {
                 onFailure: cause =>
                   Effect.sync(() => {
                     error = Option.some(Cause.squash(cause))
+                    console.log(error)
                   }),
                 onSuccess: () =>
                   Effect.sync(() => {
                     error = Option.none()
                   }),
-              })
-            }
-
-            const result = cosmosIsComplete(cts)
-            if (result) {
-              transferHashStore.startPolling(`0x${result}`)
-              onSubmit()
-              break
-            }
-          } while (!cosmosHasFailedExit(cts))
-
-          return Effect.succeed(cts)
-        })),
-      Match.orElse(() =>
-        Effect.gen(function*() {
-          yield* Effect.log("Unknown chain type")
-          error = Option.some({
-            _tag: "UnknownError",
-            cause: "Unsupported chain type",
-          })
-          return Effect.succeed("unknown chain type")
+              }),
+          ),
+          Match.orElse(() => Effect.void),
+        )
+      ),
+      Effect.repeat({
+        until: Predicate.compose(
+          WriteCosmos.is("WriteContractComplete"),
+          WriteCosmos.hasSuccessfulExit,
+        ),
+        while: compose(WriteCosmos.hasFailedExit, not),
+      }),
+      Effect.andThen(({ exit }) =>
+        Effect.sync(() => {
+          transferHashStore.startPolling(exit.value.transactionHash)
+          onSubmit()
         })
       ),
     )
-  } finally {
-    // Reset submitting state when done, regardless of success/failure
+  })
+
+  const sourceChainRpcType = step.intent.sourceChain.rpc_type
+  yield* Match.value(sourceChainRpcType).pipe(
+    Match.when("evm", () => doEvm),
+    Match.when("cosmos", () => doCosmos),
+    Match.orElse(() =>
+      Effect.gen(function*() {
+        yield* Effect.log("Unknown chain type")
+        error = Option.some({
+          _tag: "UnknownError",
+          cause: "Unsupported chain type",
+        })
+        return Effect.succeed("unknown chain type")
+      })
+    ),
+  )
+
+  yield* Effect.sync(() => {
     isSubmitting = false
-  }
+  })
 })
 
 const handleSubmit = () => {

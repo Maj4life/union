@@ -8,22 +8,13 @@ import { getCosmWasmClient } from "$lib/services/cosmos/clients.ts"
 import { getWalletClient } from "$lib/services/evm/clients.ts"
 import { wallets } from "$lib/stores/wallets.svelte.ts"
 import type { Steps } from "$lib/transfer/normal/steps"
-import {
-  hasFailedExit as cosmosHasFailedExit,
-  isComplete as cosmosIsComplete,
-  nextStateCosmos,
-  TransactionSubmissionCosmos,
-} from "$lib/transfer/shared/services/write-cosmos.ts"
-import {
-  hasFailedExit as evmHasFailedExit,
-  isComplete as evmIsComplete,
-  nextStateEvm,
-  TransactionSubmissionEvm,
-} from "$lib/transfer/shared/services/write-evm.ts"
+import * as WriteCosmos from "$lib/transfer/shared/services/write-cosmos.ts"
+import * as WriteEvm from "$lib/transfer/shared/services/write-evm.ts"
 import { cosmosStore } from "$lib/wallet/cosmos"
 import { createViemPublicClient } from "@unionlabs/sdk/evm"
-import { Cause, Effect, Exit, Match, Option } from "effect"
-import { constVoid } from "effect/Function"
+import { Cause, Effect, Exit, Match, Option, Predicate, Unify } from "effect"
+import { not } from "effect/Boolean"
+import { compose, constVoid, pipe } from "effect/Function"
 import { erc20Abi, http, isHex, toHex } from "viem"
 
 // Probably something we can import from somewhere?
@@ -40,8 +31,8 @@ type Props = {
 
 const { step, cancel, onApprove, actionButtonText }: Props = $props()
 
-let ets = $state<TransactionSubmissionEvm>(TransactionSubmissionEvm.Filling())
-let cts = $state<TransactionSubmissionCosmos>(TransactionSubmissionCosmos.Filling())
+let ets = $state<WriteEvm.TransactionState>(WriteEvm.TransactionState.Filling())
+let cts = $state<WriteCosmos.TransactionState>(WriteCosmos.TransactionState.Filling())
 
 let showError = $state(false)
 let isSubmitting = $state(false)
@@ -77,9 +68,9 @@ const approvalAmount = $derived(
 // Derive button state
 const isButtonEnabled = $derived(
   !isSubmitting
-    && ((ets._tag === "Filling" && cts._tag === "Filling")
-      || evmHasFailedExit(ets)
-      || cosmosHasFailedExit(cts)),
+    && ((WriteEvm.is("Filling")(ets) && WriteCosmos.is("Filling")(cts))
+      || WriteEvm.hasFailedExit(ets)
+      || WriteCosmos.hasFailedExit(cts)),
 )
 
 // Derive submit button text
@@ -94,14 +85,16 @@ const submitButtonText = $derived(
     ? "Switching Chain..."
     : cts._tag === "WriteContractInProgress"
     ? "Confirming Transaction..."
-    : evmHasFailedExit(ets) || cosmosHasFailedExit(cts)
+    : WriteEvm.hasFailedExit(ets) || WriteCosmos.hasFailedExit(cts)
     ? "Try Again"
     : actionButtonText,
 )
 
 const submit = Effect.gen(function*() {
-  isSubmitting = true
-  error = Option.none()
+  yield* Effect.sync(() => {
+    isSubmitting = true
+    error = Option.none()
+  })
 
   // Validate custom amount if in custom input mode
   if (showCustomInput && !(customAmount && isValidCustomAmount(customAmount))) {
@@ -110,97 +103,134 @@ const submit = Effect.gen(function*() {
     return
   }
 
-  try {
-    const chain = step.intent.sourceChain
-    const rpcType = chain.rpc_type
-    const approvalAmount = getApprovalAmount()
+  const chain = step.intent.sourceChain
+  const rpcType = chain.rpc_type
+  const approvalAmount = getApprovalAmount()
 
-    yield* Match.value(rpcType).pipe(
-      Match.when("evm", () =>
-        Effect.gen(function*() {
-          const viemChain = chain.toViemChain()
-          if (Option.isNone(viemChain)) {
-            return Effect.succeed(null)
-          }
+  const doEvm = Effect.gen(function*() {
+    const viemChain = yield* chain.toViemChain()
+    const publicClient = yield* createViemPublicClient({
+      chain: viemChain,
+      transport: http(),
+    })
+    const walletClient = yield* getWalletClient(chain)
 
-          const publicClient = yield* createViemPublicClient({
-            chain: viemChain.value,
-            transport: http(),
-          })
-
-          const walletClient = yield* getWalletClient(chain)
-
-          do {
-            ets = yield* Effect.promise(() =>
-              nextStateEvm(ets, viemChain.value, publicClient, walletClient, {
-                chain: viemChain.value,
-                account: walletClient.account,
-                address: step.token,
-                abi: erc20Abi,
-                functionName: "approve",
-                args: [step.intent.ucs03address, approvalAmount],
-              })
-            )
-
-            if (ets._tag === "SwitchChainComplete" || ets._tag === "WriteContractComplete") {
-              yield* Exit.matchEffect(ets.exit, {
-                onFailure: cause => Effect.sync(() => (error = Option.some(Cause.squash(cause)))),
-                onSuccess: () => Effect.sync(() => (error = Option.none())),
-              })
-            }
-
-            if (evmIsComplete(ets)) {
-              onApprove()
-              break
-            }
-          } while (!evmHasFailedExit(ets))
-
-          return Effect.succeed(ets)
-        })),
-      Match.when("cosmos", () =>
-        Effect.gen(function*() {
-          console.log("prior to do block")
-
-          const sender = yield* chain.getDisplayAddress(step.intent.sender) // TODO: fix type error
-
-          console.log("before do block")
-
-          do {
-            cts = yield* Effect.promise(() =>
-              nextStateCosmos(cts, chain, sender, step.token, {
-                increase_allowance: {
-                  spender: step.intent.sourceChain.minter_address_display,
-                  amount: approvalAmount,
-                },
-              })
-            )
-
-            if (cts._tag === "SwitchChainComplete" || cts._tag === "WriteContractComplete") {
-              yield* Exit.matchEffect(cts.exit, {
-                onFailure: cause => Effect.sync(() => (error = Option.some(Cause.squash(cause)))),
-                onSuccess: () => Effect.sync(() => (error = Option.none())),
-              })
-            }
-
-            if (cosmosIsComplete(cts)) {
-              onApprove()
-              break
-            }
-          } while (!cosmosHasFailedExit(cts))
-
-          return Effect.succeed(cts)
-        })),
-      Match.orElse(() =>
-        Effect.gen(function*() {
-          yield* Effect.log("Unsupported chain type")
-          error = Option.some(new Error("Unsupported chain type"))
-          return Effect.succeed("unsupported")
+    yield* pipe(
+      Effect.promise(() =>
+        WriteEvm.nextState(ets, viemChain, publicClient, walletClient, {
+          chain: viemChain,
+          account: walletClient.account,
+          address: step.token,
+          abi: erc20Abi,
+          functionName: "approve",
+          args: [step.intent.ucs03address, approvalAmount],
+        })
+      ),
+      Effect.tap(nextEts =>
+        Effect.sync(() => {
+          console.log(`ETS transitioning: ${ets._tag} -> ${nextEts._tag}`)
+          ets = nextEts
+        })
+      ),
+      Effect.tap((x) =>
+        pipe(
+          Match.value(x),
+          Match.when(
+            Predicate.or(
+              WriteEvm.is("SwitchChainComplete"),
+              WriteEvm.is("WriteContractComplete"),
+            ),
+            (a) =>
+              Exit.matchEffect(Unify.unify(a.exit), {
+                onFailure: cause =>
+                  Effect.sync(() => {
+                    error = Option.some(Cause.squash(cause))
+                    console.log(error)
+                  }),
+                onSuccess: () =>
+                  Effect.sync(() => {
+                    error = Option.none()
+                  }),
+              }),
+          ),
+          Match.orElse(() => Effect.void),
+        )
+      ),
+      Effect.repeat({
+        until: Predicate.compose(
+          WriteEvm.is("TransactionReceiptComplete"),
+          WriteEvm.hasSuccessfulExit,
+        ),
+        while: compose(WriteEvm.hasFailedExit, not),
+      }),
+      Effect.andThen(() =>
+        Effect.sync(() => {
+          onApprove()
         })
       ),
     )
-  } finally {
+  })
+
+  const doCosmos = Effect.gen(function*() {
+    // TODO: fix type error
+    const sender = yield* chain.getDisplayAddress(step.intent.sender)
+
+    yield* pipe(
+      Effect.promise(() =>
+        WriteCosmos.nextState(cts, chain, sender, step.token, {
+          increase_allowance: {
+            spender: step.intent.sourceChain.minter_address_display,
+            amount: approvalAmount,
+          },
+        })
+      ),
+      Effect.tap(nextCts =>
+        Effect.sync(() => {
+          console.log(`CTS transitioning: ${cts._tag} -> ${nextCts._tag}`)
+          cts = nextCts
+        })
+      ),
+      Effect.repeat({
+        until: Predicate.compose(
+          WriteCosmos.is("WriteContractComplete"),
+          WriteCosmos.hasSuccessfulExit,
+        ),
+        while: compose(WriteCosmos.hasFailedExit, not),
+      }),
+      Effect.map(x => Unify.unify(x.exit)),
+      Effect.flatMap(Exit.matchEffect({
+        onSuccess: (a) =>
+          Effect.sync(() => {
+            error = Option.none()
+          }),
+        onFailure: (e) =>
+          Effect.sync(() => {
+            error = Option.some(Cause.squash(e))
+          }),
+      })),
+      Effect.andThen(() =>
+        Effect.sync(() => {
+          onApprove()
+        })
+      ),
+    )
+  })
+
+  yield* Match.value(rpcType).pipe(
+    Match.when("evm", () => doEvm),
+    Match.when("cosmos", () => doCosmos),
+    Match.orElse(() =>
+      Effect.gen(function*() {
+        yield* Effect.logFatal("Unsupported chain type")
+        error = Option.some(new Error("Unsupported chain type"))
+        return Effect.succeed("unsupported")
+      })
+    ),
+  )
+
+  yield* Effect.sync(() => {
     isSubmitting = false
-  }
+  })
 })
 
 const handleSubmit = () => {
